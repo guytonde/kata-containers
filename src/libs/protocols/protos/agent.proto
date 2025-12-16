@@ -47,6 +47,9 @@ service AgentService {
 	rpc CloseStdin(CloseStdinRequest) returns (google.protobuf.Empty);
 	rpc TtyWinResize(TtyWinResizeRequest) returns (google.protobuf.Empty);
 
+	// port forwarding
+	rpc PortForward(PortForwardRequest) returns (PortForwardResponse);
+
 	// networking
 	rpc UpdateInterface(UpdateInterfaceRequest) returns (types.Interface);
 	rpc UpdateRoutes(UpdateRoutesRequest) returns (Routes);
@@ -294,6 +297,21 @@ message TtyWinResizeRequest {
 	string exec_id = 2;
 	uint32 row = 3;
 	uint32 column = 4;
+}
+
+message PortForwardRequest {
+	// The sandbox ID to forward ports for
+	string sandbox_id = 1;
+	// The list of ports to forward. Each port creates a separate TCP connection
+	// to localhost:<port> within the sandbox network namespace.
+	repeated int32 port = 2;
+	// The vsock port for streaming data (in passfd io mode)
+	// If 0, legacy streaming mode will be used
+	uint32 stream_port = 3;
+}
+
+message PortForwardResponse {
+	// reserved for future use; TODO figure this out
 }
 
 message KernelModule {

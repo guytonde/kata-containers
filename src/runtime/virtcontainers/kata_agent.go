@@ -164,6 +164,7 @@ const (
 	grpcGetIPTablesRequest                    = "grpc.GetIPTablesRequest"
 	grpcSetIPTablesRequest                    = "grpc.SetIPTablesRequest"
 	grpcSetPolicyRequest                      = "grpc.SetPolicyRequest"
+	grpcPortForwardRequest                    = "grpc.PortForwardRequest"
 )
 
 // newKataAgent returns an agent from an agent type.
@@ -796,6 +797,42 @@ func (k *kataAgent) getDNS(sandbox *Sandbox) ([]string, error) {
 	}
 	k.Logger().Debug("DNS file not present in ociMounts. Sandbox DNS will not be set.")
 	return nil, nil
+}
+
+// portForward forwards a port from the host to the sandbox
+// This is a basic implementation that calls the agent's PortForward RPC
+// sandboxID is the ID of the sandbox
+// port is the array of ports to forward 
+// streamPort is the vsock port for data streaming (0 means legacy mode)
+func (k *kataAgent) portForward(ctx context.Context, sandboxID string, ports []int32, streamPort uint32) error {
+	span, ctx := katatrace.Trace(ctx, k.Logger(), "portForward", kataAgentTracingTags)
+	defer span.End()
+
+	req := &grpc.PortForwardRequest{
+		SandboxId:  sandboxID,
+		Port:       ports,
+		StreamPort: streamPort,
+	}
+
+	_, err := k.sendReq(ctx, req)
+	if err != nil {
+		k.Logger().WithFields(logrus.Fields{
+			"sandbox-id":  sandboxID,
+			"ports":       ports,
+			"stream-port": streamPort,
+		}).WithError(err).Error("port forward request failed")
+		if err.Error() == context.DeadlineExceeded.Error() {
+			return status.Errorf(codes.DeadlineExceeded, "PortForwardRequest timed out")
+		}
+		return err
+	}
+
+	k.Logger().WithFields(logrus.Fields{
+		"sandbox-id": sandboxID,
+		"ports":      ports,
+	}).Info("port forward request successful")
+
+	return nil
 }
 
 func (k *kataAgent) startSandbox(ctx context.Context, sandbox *Sandbox) error {
@@ -2385,6 +2422,9 @@ func (k *kataAgent) installReqFunc(c *kataclient.AgentClient) {
 	}
 	k.reqHandlers[grpcSetPolicyRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
 		return k.client.AgentServiceClient.SetPolicy(ctx, req.(*grpc.SetPolicyRequest))
+	}
+	k.reqHandlers[grpcPortForwardRequest] = func(ctx context.Context, req interface{}) (interface{}, error) {
+		return k.client.AgentServiceClient.PortForward(ctx, req.(*grpc.PortForwardRequest))
 	}
 }
 

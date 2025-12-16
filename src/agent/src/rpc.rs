@@ -995,6 +995,116 @@ impl agent_ttrpc::AgentService for AgentService {
         Ok(Empty::new())
     }
 
+    async fn port_forward(
+        &self,
+        ctx: &TtrpcContext,
+        req: protocols::agent::PortForwardRequest,
+    ) -> ttrpc::Result<protocols::agent::PortForwardResponse> {
+        use tokio::net::TcpStream;
+
+        trace_rpc_call!(ctx, "port_forward", req);
+        is_allowed(&req).await?;
+
+        info!(
+            sl(),
+            "port_forward request";
+            "sandbox-id" => &req.sandbox_id,
+            "ports" => format!("{:?}", req.port),
+            "stream_port" => req.stream_port,
+        );
+
+        // Get or create vsock stream for forwarding data
+        let stream = if req.stream_port != 0 && AGENT_CONFIG.passfd_listener_port != 0 {
+            passfd_io::take_io_streams(0, req.stream_port, 0)
+                .await
+                .stdout
+                .ok_or_else(|| {
+                    ttrpc_error(
+                        ttrpc::Code::INVALID_ARGUMENT,
+                        "Failed to get stream for port forwarding",
+                    )
+                })?
+        } else {
+            return Err(ttrpc_error(
+                ttrpc::Code::UNIMPLEMENTED,
+                "Port forwarding requires stream_port in passfd mode",
+            ));
+        };
+
+        // For now, we only support forwarding one port at a time
+        // Multiple ports would require multiplexing the stream
+        if req.port.len() != 1 {
+            return Err(ttrpc_error(
+                ttrpc::Code::INVALID_ARGUMENT,
+                format!(
+                    "Only single port forwarding is currently supported, got {} ports",
+                    req.port.len()
+                ),
+            ));
+        }
+
+        let port = req.port[0];
+        if port <= 0 || port > 65535 {
+            return Err(ttrpc_error(
+                ttrpc::Code::INVALID_ARGUMENT,
+                format!("Invalid port number: {}", port),
+            ));
+        }
+
+        // Connect to the target port on localhost within the sandbox network
+        let addr = format!("127.0.0.1:{}", port);
+        let tcp_stream = TcpStream::connect(&addr).await.map_err(|e| {
+            error!(
+                sl(),
+                "Failed to connect to target"; "addr" => &addr, "error" => format!("{}", e)
+            );
+            ttrpc_error(
+                ttrpc::Code::UNAVAILABLE,
+                format!("Failed to connect to {}: {}", addr, e),
+            )
+        })?;
+
+        info!(
+            sl(),
+            "Successfully connected to localhost:{}", port
+        );
+
+        // Split streams for bidirectional copying
+        let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
+        let (mut vsock_read, mut vsock_write) = tokio::io::split(stream);
+
+        // Spawn tasks to copy data bidirectionally
+        let tcp_to_vsock = tokio::spawn(async move {
+            tokio::io::copy(&mut tcp_read, &mut vsock_write).await
+        });
+
+        let vsock_to_tcp = tokio::spawn(async move {
+            tokio::io::copy(&mut vsock_read, &mut tcp_write).await
+        });
+
+        // Wait for either direction to complete (or fail)
+        tokio::select! {
+            result = tcp_to_vsock => {
+                match result {
+                    Ok(Ok(bytes)) => info!(sl(), "TCP to vsock copy completed"; "bytes" => bytes),
+                    Ok(Err(e)) => warn!(sl(), "TCP to vsock copy failed"; "error" => format!("{}", e)),
+                    Err(e) => warn!(sl(), "TCP to vsock task failed"; "error" => format!("{}", e)),
+                }
+            }
+            result = vsock_to_tcp => {
+                match result {
+                    Ok(Ok(bytes)) => info!(sl(), "Vsock to TCP copy completed"; "bytes" => bytes),
+                    Ok(Err(e)) => warn!(sl(), "Vsock to TCP copy failed"; "error" => format!("{}", e)),
+                    Err(e) => warn!(sl(), "Vsock to TCP task failed"; "error" => format!("{}", e)),
+                }
+            }
+        }
+
+        info!(sl(), "Port forwarding session ended");
+
+        Ok(protocols::agent::PortForwardResponse::new())
+    }
+
     async fn update_interface(
         &self,
         ctx: &TtrpcContext,
